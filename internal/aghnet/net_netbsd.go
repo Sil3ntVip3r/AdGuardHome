@@ -22,29 +22,63 @@ func ifaceHasStaticIP(
 ) (ok bool, err error) {
 	const rcConfFilename = "etc/rc.conf"
 
-	walker := aghos.FileWalker(interfaceName(ifaceName).rcConfStaticConfig)
+	n := interfaceName(ifaceName)
+	var isConfigured bool
+	walker := aghos.FileWalker(func(r io.Reader) (_ []string, cont bool, err error) {
+		isConfigured, ok, err = n.rcConfStaticConfig(r)
 
-	return walker.Walk(rootDirFS, rcConfFilename)
+		return nil, true, err
+	})
+	_, err = walker.Walk(rootDirFS, rcConfFilename)
+	if err != nil || isConfigured {
+		return ok, err
+	}
+
+	filename := fmt.Sprintf("etc/ifconfig.%s", n)
+	walker = aghos.FileWalker(ifconfigStaticConfig)
+
+	return walker.Walk(rootDirFS, filename)
 }
 
 // rcConfStaticConfig checks if the interface is configured by /etc/rc.conf to
 // have a static IP.
-func (n interfaceName) rcConfStaticConfig(r io.Reader) (_ []string, cont bool, err error) {
+func (n interfaceName) rcConfStaticConfig(r io.Reader) (isConfigured, isStatic bool, err error) {
 	s := bufio.NewScanner(r)
-	for pref := fmt.Sprintf("ifconfig_%s=", n); s.Scan(); {
+	pref := fmt.Sprintf("ifconfig_%s=", n)
+	var config string
+	for s.Scan() {
 		line := strings.TrimSpace(s.Text())
 		if !strings.HasPrefix(line, pref) {
 			continue
 		}
 
-		cfgLeft, cfgRight := len(pref)+1, len(line)-1
-		if cfgLeft >= cfgRight {
-			continue
-		}
+		config = strings.Trim(strings.TrimSpace(line[len(pref):]), `"'`)
+	}
+	if err = s.Err(); err != nil || config == "" {
+		return false, false, err
+	}
 
-		// TODO(e.burkov):  Expand the check to cover possible
-		// configurations from man rc.conf(5).
-		fields := strings.Fields(line[cfgLeft:cfgRight])
+	// NetBSD processes semicolon-delimited variable values as separate lines.
+	isStatic, err = hasStaticIPv4Config(strings.NewReader(strings.ReplaceAll(config, ";", "\n")))
+
+	return true, isStatic, err
+}
+
+// ifconfigStaticConfig checks if the interface is configured by an
+// /etc/ifconfig.* file to have a static IP.
+func ifconfigStaticConfig(r io.Reader) (_ []string, cont bool, err error) {
+	var isStatic bool
+	isStatic, err = hasStaticIPv4Config(r)
+
+	return nil, !isStatic, err
+}
+
+// hasStaticIPv4Config reports whether the interface configuration contains an
+// IPv4 address.
+func hasStaticIPv4Config(r io.Reader) (isStatic bool, err error) {
+	s := bufio.NewScanner(r)
+	for s.Scan() {
+		fields := strings.Fields(s.Text())
 		switch {
 		case
 			len(fields) < 2,
@@ -52,11 +86,11 @@ func (n interfaceName) rcConfStaticConfig(r io.Reader) (_ []string, cont bool, e
 			!netutil.IsValidIPString(fields[1]):
 			continue
 		default:
-			return nil, false, s.Err()
+			return true, nil
 		}
 	}
 
-	return nil, true, s.Err()
+	return false, s.Err()
 }
 
 func ifaceSetStaticIP(
